@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <syslog.h>
 #include <signal.h>
+
 #include <libusb-1.0/libusb.h>
 
 #define CONFIG_FILE "/etc/antec/sensors.conf"
@@ -27,18 +28,15 @@ static void handle_signal(int sig)
 }
 
 // =========================================================
-// CONFIG STRUCTS
+// USB CONTEXT
 // =========================================================
 
 typedef struct {
-    char sensor[128];
-    char name[128];
-} sensor_cfg_t;
-
-typedef struct {
-    sensor_cfg_t cpu;
-    sensor_cfg_t gpu;
-} config_t;
+    libusb_device_handle *dev;
+    unsigned char ep;
+    int ep_type;
+    libusb_context *ctx;
+} usb_ctx;
 
 // =========================================================
 // TRIM
@@ -46,9 +44,11 @@ typedef struct {
 
 static void trim(char *s)
 {
-    if (!s) return;
-
     char *start = s;
+
+    if (!s)
+        return;
+
     while (*start == ' ' || *start == '\t')
         start++;
 
@@ -64,42 +64,43 @@ static void trim(char *s)
 }
 
 // =========================================================
-// USB CONTEXT
-// =========================================================
-
-typedef struct {
-    libusb_device_handle *dev;
-    unsigned char ep;
-    int ep_type;
-    libusb_context *ctx;
-} usb_ctx;
-
-// =========================================================
 // USB INIT
 // =========================================================
 
 static usb_ctx init_usb(void)
 {
+    struct libusb_config_descriptor *cfg;
     usb_ctx ctx = {0};
+    int ret;
 
     if (libusb_init(&ctx.ctx) != 0) {
         syslog(LOG_ERR, "libusb_init failed");
         return ctx;
     }
 
-    ctx.dev = libusb_open_device_with_vid_pid(ctx.ctx,
-                                               VENDOR_ID,
-                                               PRODUCT_ID);
+    ctx.dev = libusb_open_device_with_vid_pid(ctx.ctx, VENDOR_ID, PRODUCT_ID);
 
     if (!ctx.dev) {
         syslog(LOG_ERR, "USB device not found");
         return ctx;
     }
 
-    libusb_set_configuration(ctx.dev, 1);
-    libusb_claim_interface(ctx.dev, 0);
+    ret = libusb_set_configuration(ctx.dev, 1);
+    if (ret != 0 && ret != LIBUSB_ERROR_BUSY) {
+        syslog(LOG_ERR, "libusb_set_configuration failed: %s",
+               libusb_error_name(ret));
+        return ctx;
+    }
 
-    struct libusb_config_descriptor *cfg;
+    ret = libusb_claim_interface(ctx.dev, 0);
+    if (ret != 0) {
+        syslog(LOG_ERR, "libusb_claim_interface failed: %s",
+                libusb_error_name(ret));
+
+        libusb_close(ctx.dev);
+        ctx.dev = NULL;
+        return ctx;
+    }
 
     if (libusb_get_active_config_descriptor(
             libusb_get_device(ctx.dev), &cfg) != 0) {
@@ -136,30 +137,30 @@ static int usb_write(usb_ctx *ctx,
                       int len)
 {
     int transferred = 0;
-    int r;
+    int ret;
 
-    r = libusb_bulk_transfer(ctx->dev,
-                             ctx->ep,
-                             data,
-                             len,
-                             &transferred,
-                             1000);
+    ret = libusb_bulk_transfer(ctx->dev,
+                               ctx->ep,
+                               data,
+                               len,
+                               &transferred,
+                               1000);
 
-    if (r == 0)
-        return 1;
+    if (ret == 0)
+        return ret;
 
-    r = libusb_interrupt_transfer(ctx->dev,
-                                  ctx->ep,
-                                  data,
-                                  len,
-                                  &transferred,
-                                  1000);
+    ret = libusb_interrupt_transfer(ctx->dev,
+                                    ctx->ep,
+                                    data,
+                                    len,
+                                    &transferred,
+                                    1000);
 
-    if (r == 0)
-        return 1;
+    if (ret == 0)
+        return ret;
 
-    syslog(LOG_ERR, "USB transfer failed: %s", libusb_error_name(r));
-    return 0;
+    syslog(LOG_ERR, "USB transfer failed: %s", libusb_error_name(ret));
+    return -1;
 }
 
 // =========================================================
@@ -170,30 +171,35 @@ static int find_temp_file(const char *sensor,
                           const char *label,
                           char *out)
 {
-    DIR *d = opendir("/sys/class/hwmon");
-    if (!d) return 0;
-
     struct dirent *de;
+    struct dirent *de2;
+    char base[PATH_MAX];
+    char namefile[PATH_MAX];
+    char label_path[PATH_MAX];
+    char hwname[128];
+    char val[128];
+    FILE *nf, *f;
+    DIR *d2, *d;
+
+    d = opendir("/sys/class/hwmon");
+    if (!d) return 0;
 
     while ((de = readdir(d))) {
 
         if (de->d_name[0] == '.')
             continue;
 
-        char base[PATH_MAX];
         snprintf(base, sizeof(base),
                  "/sys/class/hwmon/%s", de->d_name);
 
-        char namefile[PATH_MAX];
         if (snprintf(namefile, sizeof(namefile),
                      "%s/name", base) >= (int)sizeof(namefile)) {
                 continue;
         }
 
-        FILE *nf = fopen(namefile, "r");
+        nf = fopen(namefile, "r");
         if (!nf) continue;
 
-        char hwname[128];
         fgets(hwname, sizeof(hwname), nf);
         fclose(nf);
 
@@ -203,26 +209,22 @@ static int find_temp_file(const char *sensor,
         if (sensor && sensor[0] && strcmp(hwname, sensor) != 0)
             continue;
 
-        DIR *d2 = opendir(base);
+        d2 = opendir(base);
         if (!d2) continue;
-
-        struct dirent *de2;
 
         while ((de2 = readdir(d2))) {
 
             if (!strstr(de2->d_name, "_label"))
                 continue;
 
-            char label_path[PATH_MAX];
             if (snprintf(label_path, sizeof(label_path), "%s/%s", base,
                          de2->d_name) >= (int)sizeof(label_path)) {
                 continue;
             }
 
-            FILE *f = fopen(label_path, "r");
+            f = fopen(label_path, "r");
             if (!f) continue;
-
-            char val[128];
+       
             fgets(val, sizeof(val), f);
             fclose(f);
 
@@ -230,10 +232,11 @@ static int find_temp_file(const char *sensor,
             trim(val);
 
             if (strcmp(val, label) == 0) {
+                char *p;
 
                 snprintf(out, PATH_MAX, "%s", label_path);
 
-                char *p = strstr(out, "_label");
+                p = strstr(out, "_label");
                 if (p) strcpy(p, "_input");
 
                 closedir(d2);
@@ -255,11 +258,12 @@ static int find_temp_file(const char *sensor,
 
 static float read_temp(const char *path)
 {
+    char buf[64];
+
     FILE *f = fopen(path, "r");
     if (!f)
         return 0.0f;
 
-    char buf[64];
     fgets(buf, sizeof(buf), f);
     fclose(f);
 
@@ -289,6 +293,7 @@ static int generate_payload(float cpu,
 {
     char c1[8], c2[8];
     unsigned char raw[6];
+    int sum = 7;
 
     encode_temperature(cpu, c1);
     encode_temperature(gpu, c2);
@@ -296,7 +301,6 @@ static int generate_payload(float cpu,
     sscanf(c1, "%2hhx%2hhx%2hhx", &raw[0], &raw[1], &raw[2]);
     sscanf(c2, "%2hhx%2hhx%2hhx", &raw[3], &raw[4], &raw[5]);
 
-    int sum = 7;
     for (int i = 0; i < 6; i++)
         sum += raw[i];
 
@@ -321,6 +325,10 @@ int main()
     unsigned char payload[64];
     char cpu_path[PATH_MAX] = {0};
     char gpu_path[PATH_MAX] = {0};
+    usb_ctx usb;
+    float cpu, gpu;
+    int len, ret;
+
     openlog("sensor-daemon", LOG_PID, LOG_DAEMON);
 
     signal(SIGINT, handle_signal);
@@ -331,20 +339,21 @@ int main()
     find_temp_file("k10temp", "Tctl", cpu_path);
     find_temp_file("amdgpu", "junction", gpu_path);
 
-    usb_ctx usb = init_usb();
+    usb = init_usb();
     if (!usb.dev) {
         syslog(LOG_ERR, "USB init failed");
         return 1;
     }
 
     while (running) {
+        cpu = read_temp(cpu_path);
+        gpu = read_temp(gpu_path);
 
-        float cpu = read_temp(cpu_path);
-        float gpu = read_temp(gpu_path);
+        len = generate_payload(cpu, gpu, payload);
 
-        int len = generate_payload(cpu, gpu, payload);
-
-        usb_write(&usb, payload, len);
+        ret = usb_write(&usb, payload, len);
+        if(ret)
+           usleep(1500000); // Extra wait in case of failure
 
         usleep(500000);
     }

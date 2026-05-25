@@ -21,6 +21,11 @@
 
 static volatile int running = 1;
 
+typedef struct {
+    char sensor[128];
+    char name[128];
+} sensor_config;
+
 static void handle_signal(int sig)
 {
     syslog(LOG_INFO, "Received signal %d, stopping daemon...", sig);
@@ -61,6 +66,74 @@ static void trim(char *s)
            *(end - 1) == '\t' ||
            *(end - 1) == '\n'))
         *(--end) = '\0';
+}
+
+// =========================================================
+// CONF PARSER
+// =========================================================
+static int load_sensor_config(const char *section, sensor_config *cfg)
+{
+    FILE *f;
+    char line[256];
+    char current[64] = {0};
+
+    memset(cfg, 0, sizeof(*cfg));
+
+    f = fopen(CONFIG_FILE, "r");
+    if (!f) {
+        syslog(LOG_ERR, "Cannot open config file: %s", CONFIG_FILE);
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), f)) {
+
+        trim(line);
+
+        // Ignore comments & empty lines
+        if (line[0] == '#' || line[0] == ';' || line[0] == '\0')
+            continue;
+
+        // Section [cpu]
+        if (line[0] == '[') {
+            char *end = strchr(line, ']');
+
+            if (!end)
+                continue;
+
+            *end = '\0';
+
+            snprintf(current, sizeof(current), "%.63s", line + 1);
+            current[sizeof(current) - 1] = '\0';
+            continue;
+        }
+
+        // Bad section
+        if (strcmp(current, section) != 0)
+            continue;
+
+        char *eq = strchr(line, '=');
+        if (!eq)
+            continue;
+
+        *eq = '\0';
+
+        char *key = line;
+        char *value = eq + 1;
+
+        trim(key);
+        trim(value);
+
+        if (strcmp(key, "sensor") == 0) {
+            snprintf(cfg->sensor, sizeof(cfg->sensor), "%s", value);
+        }
+        else if (strcmp(key, "name") == 0) {
+            snprintf(cfg->name, sizeof(cfg->name), "%s", value);
+        }
+    }
+
+    fclose(f);
+
+    return (cfg->sensor[0] && cfg->name[0]);
 }
 
 // =========================================================
@@ -325,6 +398,7 @@ int main()
     unsigned char payload[64];
     char cpu_path[PATH_MAX] = {0};
     char gpu_path[PATH_MAX] = {0};
+    sensor_config cpu_cfg, gpu_cfg;
     usb_ctx usb;
     float cpu, gpu;
     int len, ret;
@@ -336,8 +410,21 @@ int main()
 
     syslog(LOG_INFO, "Daemon starting...");
 
-    find_temp_file("k10temp", "Tctl", cpu_path);
-    find_temp_file("amdgpu", "junction", gpu_path);
+    
+
+    if (!load_sensor_config("cpu", &cpu_cfg)) {
+        syslog(LOG_ERR, "Failed to load CPU config");
+        return 1;
+    }
+
+    if (!load_sensor_config("gpu", &gpu_cfg)) {
+        syslog(LOG_ERR, "Failed to load GPU config");
+        return 1;
+    }
+
+    find_temp_file(cpu_cfg.sensor, cpu_cfg.name, cpu_path);
+
+    find_temp_file(gpu_cfg.sensor,gpu_cfg.name, gpu_path);
 
     usb = init_usb();
     if (!usb.dev) {

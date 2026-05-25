@@ -3,67 +3,111 @@ Antec Display Service Setup
 
 Tested on Fedora Linux and CachyOS.
 
+Overview
+--------
+
+This project provides a native C daemon that reads CPU/GPU temperatures from hwmon and sends them to an Antec USB device. It runs as a systemd service.
+
 Files
 -----
 
-- ``antec_display_service.py`` — Main service script
+- ``temp-monitor.c`` — Main C source code
+- ``Makefile`` — Build and install system
+- ``antec_sensor`` — Compiled binary (generated)
 - ``antec_display.service`` — systemd service file
-- ``sensors.conf`` — Sensor configuration
+- ``helper-sensors.sh`` — Interactive sensor discovery tool
 
-Installation
-------------
+Build & Installation
+--------------------
 
-Place ``antec_display_service.py`` somewhere appropriate for your system.
+### 1. Build the project
 
-Example:
+Use the provided Makefile:
 
 .. code-block:: bash
 
-   sudo cp antec_display_service.py /bin/
-   sudo chmod +x /usr/bin/antec_display_service.py
+   make
 
-Install the systemd service:
+This will generate the binary:
+
+::
+
+   sudo ./antec_sensor
+
+
+### 2. Install the binary (recommended)
+
+Install it system-wide in a standard local system path:
+
+.. code-block:: bash
+
+   sudo make install
+
+This installs the binary to:
+
+::
+
+   /usr/local/bin/
+
+---
+
+Systemd Setup
+-------------
+
+### 1. Install service file
 
 .. code-block:: bash
 
    sudo cp antec_display.service /etc/systemd/system/
    sudo systemctl daemon-reload
-   sudo systemctl enable antec_display
 
-Sensor Setup
-------------
-
-Run the script manually first:
+### 2. Enable service
 
 .. code-block:: bash
 
-   python3 /usr/bin/antec_display_service.py
+   sudo systemctl enable antec_display.service
 
-The script will walk you through selecting temperature sensors. Once the display is working, exit with ``Ctrl+C``.
-
-Create the config directory:
+### 3. Start service
 
 .. code-block:: bash
 
-   sudo mkdir -p /etc/antec
+   sudo systemctl start antec_display.service
 
-Edit ``sensors.conf`` to match the sensors you selected, then place it in:
+---
 
-::
+Sensor Detection
+----------------
 
-   /etc/antec/sensors.conf
+On startup, the daemon automatically scans hwmon, for example:
 
-Example:
+- CPU: ``k10temp / Tctl``
+- GPU: ``amdgpu / junction``
 
-.. code-block:: bash
-
-   sudo cp sensors.conf /etc/antec/
-
-Start the service:
+You can verify sensors manually:
 
 .. code-block:: bash
 
-   sudo systemctl start antec_display
+   ls /sys/class/hwmon/
+
+---
+
+Sensor selection helper tool
+----------------------------
+
+To help identify the correct CPU/GPU temperature sources, use the included helper script:
+
+.. code-block:: bash
+
+   chmod +x helper-sensors.sh
+   ./helper-sensors.sh
+
+This tool will:
+
+- List all hwmon devices
+- Show sensor labels and current temperatures
+- Help you identify correct CPU and GPU temperature sources
+
+---
 
 Troubleshooting
 ---------------
@@ -72,11 +116,42 @@ Check service status:
 
 .. code-block:: bash
 
-   systemctl status antec_display
+   systemctl status antec_display.service
 
 View logs:
 
 .. code-block:: bash
 
-   journalctl -u antec_display -f
+   journalctl -u antec_display.service -f
 
+USB debugging:
+
+.. code-block:: bash
+
+   lsusb
+   dmesg | grep usb
+
+---
+
+Cleanup
+-------
+
+To remove the binary:
+
+.. code-block:: bash
+
+   sudo rm /usr/local/bin/antec_sensor
+
+To disable and remove the service:
+
+.. code-block:: bash
+
+   sudo systemctl disable antec_display.service
+   sudo rm /etc/systemd/system/antec_display.service
+   sudo systemctl daemon-reload
+
+To clean build files:
+
+.. code-block:: bash
+
+   make clean

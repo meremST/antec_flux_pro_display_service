@@ -240,19 +240,101 @@ static int usb_write(usb_ctx *ctx,
 // HWMON SEARCH
 // =========================================================
 
+/*
+ * Reads the sensor name from "<base>/name" and compares it to `sensor`.
+ * Returns 1 if the hwmon directory matches the requested sensor,
+ * or if no sensor filter is set (NULL or empty). Returns 0 otherwise.
+ */
+static int hwmon_matches_sensor(const char *base, const char *sensor)
+{
+    char namefile[PATH_MAX];
+    char hwname[128];
+    FILE *nf;
+
+    if (snprintf(namefile, sizeof(namefile), "%s/name", base) >= (int)sizeof(namefile))
+        return 0;
+
+    nf = fopen(namefile, "r");
+    if (!nf) return 0;
+
+    if (!fgets(hwname, sizeof(hwname), nf)) hwname[0] = '\0';
+    fclose(nf);
+
+    hwname[strcspn(hwname, "\n")] = 0;
+    trim(hwname);
+
+    /* No sensor filter: accept all hwmon entries */
+    if (!sensor || !sensor[0])
+        return 1;
+
+    return strcmp(hwname, sensor) == 0;
+}
+
+/*
+ * Scans "*_label" files inside `base` looking for one whose content matches
+ * `label`. If found, writes the corresponding "_input" path into `out`
+ * (same prefix, suffix replaced) and returns 1. Returns 0 otherwise.
+ */
+static int find_input_for_label(const char *base, const char *label, char *out)
+{
+    struct dirent *de;
+    char label_path[PATH_MAX];
+    char val[128];
+    FILE *f;
+    DIR *d;
+    char *p;
+
+    d = opendir(base);
+    if (!d) return 0;
+
+    while ((de = readdir(d))) {
+
+        /* Only process files whose name contains "_label" */
+        if (!strstr(de->d_name, "_label"))
+            continue;
+
+        if (snprintf(label_path, sizeof(label_path), "%s/%s", base,
+                     de->d_name) >= (int)sizeof(label_path))
+            continue;
+
+        f = fopen(label_path, "r");
+        if (!f) continue;
+
+        if (!fgets(val, sizeof(val), f)) val[0] = '\0';
+        fclose(f);
+
+        val[strcspn(val, "\n")] = 0;
+        trim(val);
+
+        if (strcmp(val, label) != 0)
+            continue;
+
+        /* Label matched: build the "_input" path from the "_label" path */
+        snprintf(out, PATH_MAX, "%s", label_path);
+        p = strstr(out, "_label");
+        if (p) strcpy(p, "_input");
+
+        closedir(d);
+        return 1;
+    }
+
+    closedir(d);
+    return 0;
+}
+
+/*
+ * Searches /sys/class/hwmon for the "_input" temperature file matching
+ * both `sensor` (hwmon chip name, NULL to match any) and `label`.
+ * Writes the absolute path into `out` (PATH_MAX bytes) and returns 1 if
+ * found, 0 otherwise.
+ */
 static int find_temp_file(const char *sensor,
                           const char *label,
                           char *out)
 {
     struct dirent *de;
-    struct dirent *de2;
     char base[PATH_MAX];
-    char namefile[PATH_MAX];
-    char label_path[PATH_MAX];
-    char hwname[128];
-    char val[128];
-    FILE *nf, *f;
-    DIR *d2, *d;
+    DIR *d;
 
     d = opendir("/sys/class/hwmon");
     if (!d) return 0;
@@ -262,63 +344,15 @@ static int find_temp_file(const char *sensor,
         if (de->d_name[0] == '.')
             continue;
 
-        snprintf(base, sizeof(base),
-                 "/sys/class/hwmon/%s", de->d_name);
+        snprintf(base, sizeof(base), "/sys/class/hwmon/%s", de->d_name);
 
-        if (snprintf(namefile, sizeof(namefile),
-                     "%s/name", base) >= (int)sizeof(namefile)) {
-                continue;
-        }
-
-        nf = fopen(namefile, "r");
-        if (!nf) continue;
-
-        fgets(hwname, sizeof(hwname), nf);
-        fclose(nf);
-
-        hwname[strcspn(hwname, "\n")] = 0;
-        trim(hwname);
-
-        if (sensor && sensor[0] && strcmp(hwname, sensor) != 0)
+        if (!hwmon_matches_sensor(base, sensor))
             continue;
 
-        d2 = opendir(base);
-        if (!d2) continue;
-
-        while ((de2 = readdir(d2))) {
-
-            if (!strstr(de2->d_name, "_label"))
-                continue;
-
-            if (snprintf(label_path, sizeof(label_path), "%s/%s", base,
-                         de2->d_name) >= (int)sizeof(label_path)) {
-                continue;
-            }
-
-            f = fopen(label_path, "r");
-            if (!f) continue;
-       
-            fgets(val, sizeof(val), f);
-            fclose(f);
-
-            val[strcspn(val, "\n")] = 0;
-            trim(val);
-
-            if (strcmp(val, label) == 0) {
-                char *p;
-
-                snprintf(out, PATH_MAX, "%s", label_path);
-
-                p = strstr(out, "_label");
-                if (p) strcpy(p, "_input");
-
-                closedir(d2);
-                closedir(d);
-                return 1;
-            }
+        if (find_input_for_label(base, label, out)) {
+            closedir(d);
+            return 1;
         }
-
-        closedir(d2);
     }
 
     closedir(d);
@@ -337,7 +371,7 @@ static float read_temp(const char *path)
     if (!f)
         return 0.0f;
 
-    fgets(buf, sizeof(buf), f);
+    if (!fgets(buf, sizeof(buf), f)) buf[0] = '\0';
     fclose(f);
 
     return atof(buf) / 1000.0f;
